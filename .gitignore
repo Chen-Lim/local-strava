@@ -1,0 +1,28 @@
+# Rust / Cargo
+/target
+# Keep Cargo.lock for binary projects to ensure reproducible builds
+# Cargo.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+
+# Project-Specific Data (Personal Activity Records)
+# We ignore these to keep your personal health data out of git
+/inbox/
+/library/
+/archive/
+/new/
+/workspace/
+
+# Application State
+# Ignore local database and logs
+/state/activity_index.json
+/state/exports.jsonl
+/state/logs/
+
+# Optional: Keep the state directory structure but ignore files
+# !/state/.gitkeep
