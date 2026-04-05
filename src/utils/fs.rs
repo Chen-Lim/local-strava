@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
@@ -22,27 +22,37 @@ pub fn infer_output_extension(source_basename: &str) -> Option<&'static str> {
     }
 }
 
-pub fn unique_semantic_path(dir: &Path, sanitized_name: &str, extension: &str) -> Result<PathBuf> {
-    let base_name = sanitized_name.trim();
-    let mut candidate = dir.join(format!("{base_name}{extension}"));
-    if !candidate.exists() {
-        return Ok(candidate);
-    }
+pub fn deterministic_activity_path(
+    dir: &Path,
+    activity_id: &str,
+    sanitized_name: &str,
+    extension: &str,
+) -> PathBuf {
+    let file_stem = if sanitized_name.trim().is_empty() {
+        format!("{activity_id}__untitled")
+    } else {
+        format!("{activity_id}__{}", sanitized_name.trim())
+    };
 
-    let mut counter = 1usize;
-    loop {
-        candidate = dir.join(format!("{base_name}_{counter}{extension}"));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-        counter += 1;
-    }
+    dir.join(format!("{file_stem}{extension}"))
 }
 
-pub fn timestamp_string() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    secs.to_string()
+pub fn copy_file_overwrite(src: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        fs::remove_file(dest)
+            .with_context(|| format!("failed to remove existing file {}", dest.display()))?;
+    }
+
+    fs::copy(src, dest).with_context(|| {
+        format!(
+            "failed to copy file from {} to {}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub fn timestamp_rfc3339() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

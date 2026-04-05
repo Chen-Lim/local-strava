@@ -1,4 +1,5 @@
 mod cli;
+mod db;
 mod domain;
 mod importers;
 mod services;

@@ -12,6 +12,7 @@ pub struct StravaExportBatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportLogEntry {
+    pub run_id: String,
     pub batch_name: String,
     pub batch_path: String,
     pub processed_at: String,

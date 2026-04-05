@@ -1,27 +1,21 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rayon::prelude::*;
 
-use crate::domain::activity::{ActivityRecord, ActivityStatus};
+use crate::db::models::{ActivityRecord, SyncRun};
+use crate::db::sqlite::SqliteActivityStore;
+use crate::domain::activity::ActivityCsvRow;
 use crate::domain::export_batch::{ExportLogEntry, StravaExportBatch};
 use crate::importers::strava;
-use crate::services::{consistency, decompress, incremental, naming};
-use crate::storage::{export_log, index_store};
+use crate::services::{consistency, decompress, naming};
+use crate::storage::export_log;
 use crate::utils::fs;
 
 pub fn run_sync(project_root: &Path, batch_name: Option<&str>) -> Result<()> {
     consistency::ensure_project_layout(project_root)?;
-
-    let index_path = project_root.join("state/activity_index.json");
-    if index_store::is_effectively_empty(&index_path)?
-        && project_root.join("activities.csv").is_file()
-    {
-        consistency::bootstrap_legacy_index(project_root)?;
-    }
-
-    let mut index = index_store::load(&index_path)?;
+    let db_path = project_root.join("state/strava.db");
+    let mut store = SqliteActivityStore::open(&db_path)?;
     let batches = resolve_batches(project_root, batch_name)?;
 
     if batches.is_empty() {
@@ -29,40 +23,42 @@ pub fn run_sync(project_root: &Path, batch_name: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    for batch in batches {
-        // Scheme A: Parallel processing of files, separate aggregation phase for index updates
-        let (summary, new_records) = process_batch(project_root, &batch, &index)?;
+    let sync_run = SyncRun {
+        run_id: format!("sync_{}", fs::timestamp_rfc3339().replace(':', "-")),
+        started_at: fs::timestamp_rfc3339(),
+        completed_at: None,
+    };
+    store.begin_sync_run(&sync_run)?;
 
-        // Unify and commit index updates sequentially
-        for record in new_records {
-            index.insert(record.activity_id.clone(), record);
-        }
+    for batch in batches {
+        let (summary, new_records) = process_batch(project_root, &batch, &store, &sync_run.run_id)?;
+        let inserted = store.insert_activities(&new_records)?;
 
         let batch_name = summary.batch_name.clone();
         export_log::append(
             &project_root.join("state/exports.jsonl"),
             &ExportLogEntry {
+                run_id: sync_run.run_id.clone(),
                 batch_name,
                 batch_path: summary.batch_path,
-                processed_at: fs::timestamp_string(),
+                processed_at: fs::timestamp_rfc3339(),
                 total_rows: summary.total_rows,
-                new_activities: summary.new_activities,
+                new_activities: inserted,
                 skipped_activities: summary.skipped_activities,
                 failed_activities: summary.failed_activities,
             },
         )?;
-
-        index_store::save(&index_path, &index)?;
         println!(
             "Batch {}: total={}, new={}, skipped={}, failed={}",
             summary.batch_name,
             summary.total_rows,
-            summary.new_activities,
+            inserted,
             summary.skipped_activities,
             summary.failed_activities
         );
     }
 
+    store.complete_sync_run(&sync_run.run_id, &fs::timestamp_rfc3339())?;
     Ok(())
 }
 
@@ -70,7 +66,6 @@ struct BatchSummary {
     batch_name: String,
     batch_path: String,
     total_rows: usize,
-    new_activities: usize,
     skipped_activities: usize,
     failed_activities: usize,
 }
@@ -89,14 +84,20 @@ fn resolve_batches(
 fn process_batch(
     project_root: &Path,
     batch: &StravaExportBatch,
-    index: &HashMap<String, ActivityRecord>,
+    store: &SqliteActivityStore,
+    run_id: &str,
 ) -> Result<(BatchSummary, Vec<ActivityRecord>)> {
     let rows = strava::read_activities(&batch.csv_path)?;
-    let pending = incremental::pending_rows(&rows, index);
     let total_rows = rows.len();
+    let existing_ids = store.existing_ids(rows.iter().map(|row| row.activity_id.as_str()))?;
+    let pending: Vec<ActivityCsvRow> = rows
+        .into_iter()
+        .filter(|row| !existing_ids.contains(&row.activity_id))
+        .collect();
     let skipped_activities = total_rows.saturating_sub(pending.len());
 
-    // Process all pending rows in parallel using rayon
+    ensure_library_dirs(project_root)?;
+
     let results: Vec<Result<Option<ActivityRecord>, String>> = pending
         .into_par_iter()
         .map(|row| {
@@ -115,40 +116,32 @@ fn process_batch(
             };
 
             let dest_dir = library_dir_for_extension(project_root, extension);
-            if let Err(e) = fs::ensure_dir(&dest_dir) {
-                return Err(format!(
-                    "Failed to create directory {}: {}",
-                    dest_dir.display(),
-                    e
-                ));
-            }
-
             let sanitized_name = naming::sanitize_filename(&row.activity_name);
-            let dest_path = match fs::unique_semantic_path(&dest_dir, &sanitized_name, extension) {
-                Ok(path) => path,
-                Err(e) => return Err(format!("Failed to get unique path: {}", e)),
-            };
+            let dest_path = fs::deterministic_activity_path(
+                &dest_dir,
+                &row.activity_id,
+                &sanitized_name,
+                extension,
+            );
 
             match decompress::decompress_gzip(&src_path, &dest_path) {
-                Ok(()) => {
-                    if let Err(e) = copy_to_new_folder(project_root, extension, &dest_path) {
-                        return Err(format!("Failed to copy to new folder: {}", e));
-                    }
-
-                    Ok(Some(ActivityRecord {
-                        activity_id: row.activity_id.clone(),
-                        activity_name_raw: row.activity_name.clone(),
-                        activity_name_sanitized: sanitized_name,
-                        activity_date: row.activity_date.clone(),
-                        source_batch: batch.batch_name.clone(),
-                        source_file: row.source_file.clone(),
-                        source_basename: row.source_basename.clone(),
-                        file_format: extension.trim_start_matches('.').to_string(),
-                        library_path: Some(relative_to_root(project_root, &dest_path)),
-                        processed_at: fs::timestamp_string(),
-                        status: ActivityStatus::Ready,
-                    }))
-                }
+                Ok(()) => Ok(Some(ActivityRecord {
+                    activity_id: row.activity_id.clone(),
+                    activity_name_raw: row.activity_name.clone(),
+                    activity_name_sanitized: if sanitized_name.trim().is_empty() {
+                        "untitled".to_string()
+                    } else {
+                        sanitized_name
+                    },
+                    activity_date: row.activity_date.clone(),
+                    source_batch: batch.batch_name.clone(),
+                    source_file: row.source_file.clone(),
+                    source_basename: row.source_basename.clone(),
+                    file_format: extension.trim_start_matches('.').to_string(),
+                    library_path: relative_to_root(project_root, &dest_path),
+                    import_run_id: run_id.to_string(),
+                    imported_at: fs::timestamp_rfc3339(),
+                })),
                 Err(err) => Err(format!(
                     "Failed to process activity {} from {}: {err:#}",
                     row.activity_id, row.source_basename
@@ -157,14 +150,12 @@ fn process_batch(
         })
         .collect();
 
-    let mut new_activities = 0usize;
     let mut failed_activities = 0usize;
     let mut new_records = Vec::new();
 
     for res in results {
         match res {
             Ok(Some(record)) => {
-                new_activities += 1;
                 new_records.push(record);
             }
             Ok(None) => {}
@@ -179,12 +170,22 @@ fn process_batch(
         batch_name: batch.batch_name.clone(),
         batch_path: relative_to_root(project_root, &batch.root),
         total_rows,
-        new_activities,
         skipped_activities,
         failed_activities,
     };
 
     Ok((summary, new_records))
+}
+
+fn ensure_library_dirs(project_root: &Path) -> Result<()> {
+    for dir in [
+        project_root.join("library/activities/fit"),
+        project_root.join("library/activities/tcx"),
+        project_root.join("library/activities/gpx"),
+    ] {
+        fs::ensure_dir(&dir)?;
+    }
+    Ok(())
 }
 
 fn library_dir_for_extension(project_root: &Path, extension: &str) -> PathBuf {
@@ -201,27 +202,4 @@ fn relative_to_root(project_root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
-}
-
-fn copy_to_new_folder(project_root: &Path, extension: &str, source_path: &Path) -> Result<()> {
-    let new_dir = project_root.join("new");
-    fs::ensure_dir(&new_dir)?;
-
-    let file_name = match source_path.file_name() {
-        Some(name) => name,
-        None => return Ok(()),
-    };
-
-    let dest_path = new_dir.join(file_name);
-    // Be careful with concurrency here. Ignore errors if it's not a file etc.
-    // If it's already there and being written, we don't strictly care as long as we don't panic.
-    if dest_path.exists() {
-        let _ = std::fs::remove_file(&dest_path);
-    }
-
-    if extension == ".fit" {
-        let _ = std::fs::copy(source_path, &dest_path);
-    }
-
-    Ok(())
 }

@@ -27,7 +27,10 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some("bootstrap-legacy") => services::consistency::bootstrap_legacy_index(&cwd),
+        Some("export-new") => {
+            let since = args.get(2).map(String::as_str);
+            services::export::export_new(&cwd, since)
+        }
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
             Ok(())
@@ -51,10 +54,10 @@ fn print_help() {
     println!("Usage:");
     println!("  cargo run -- sync [batch_name]");
     println!("  cargo run -- scan");
-    println!("  cargo run -- bootstrap-legacy");
+    println!("  cargo run -- export-new [YYYY-MM-DD]");
     println!();
     println!("Commands:");
     println!("  sync              Process one inbox batch or all batches when omitted");
     println!("  scan              List valid Strava export batches under inbox/");
-    println!("  bootstrap-legacy  Seed state/activity_index.json from root activities.csv");
+    println!("  export-new        Export activities from the latest sync run or from a start date");
 }

@@ -38,7 +38,7 @@ Strava/
 │       ├── activities/     <-- 包含原始活动文件 / Contains raw activity files
 │       └── activities.csv  <-- 活动索引 CSV / Activity index CSV
 ├── library/                <-- 处理后的文件将分类存放在这里 / Processed files will be sorted here
-├── state/                  <-- 同步状态和索引 / Sync state and indexing
+├── state/                  <-- SQLite 状态与日志 / SQLite state and logs
 └── strava-sync             <-- 编译后的可执行文件 / Compiled executable
 ```
 
@@ -52,17 +52,31 @@ Ensure you have Rust installed, then run the following command in the project ro
 cargo run -- sync
 ```
 
-该工具会自动识别 `inbox/` 中的新活动，将其解压、重命名并根据文件格式（FIT/TCX/GPX）存入 `library/` 文件夹。
-The tool will automatically detect new activities in `inbox/`, decompress, rename, and sort them into the `library/` folder based on file format (FIT/TCX/GPX).
+该工具会自动识别 `inbox/` 中的新活动，将其解压、按确定性规则重命名，并根据文件格式（FIT/TCX/GPX）存入 `library/` 文件夹。同步状态存储在 `state/strava.db` 中。
+The tool will automatically detect new activities in `inbox/`, decompress them, rename them deterministically, and sort them into the `library/` folder based on file format (FIT/TCX/GPX). Sync state is stored in `state/strava.db`.
+
+如需把最近一次 `sync` 导入的文件导出到 `new/`，运行：
+To export files from the most recent `sync` run into `new/`, run:
+
+```bash
+cargo run -- export-new
+```
+
+如需按起始日期导出，使用 UTC 日期格式：
+To export from a specific UTC start date, use:
+
+```bash
+cargo run -- export-new 2026-04-06
+```
 
 ---
 
 ## 主要特性 / Key Features
 
-- **增量同步 (Incremental Sync):** 自动记录已处理的活动，避免重复处理。
+- **增量同步 (Incremental Sync):** 使用 SQLite 记录已处理活动，避免重复处理。
 - **并行处理 (Parallel Processing):** 利用多线程（Rayon）高效处理大量活动文件。
-- **结构化管理 (Structured Library):** 自动将活动重命名为更具语义的名称，并分类存放。
-- **一致性检查 (Consistency Check):** 维护本地索引以确保数据完整性。
+- **结构化管理 (Structured Library):** 文件名固定为 `{activity_id}__{sanitized_name}.{ext}`，并分类存放。
+- **导出新活动 (Export New):** 默认导出最近一次 `sync` 导入的活动，也支持按 `YYYY-MM-DD` 过滤。
 
 ---
 

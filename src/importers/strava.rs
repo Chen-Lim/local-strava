@@ -7,10 +7,10 @@ use csv::StringRecord;
 use crate::domain::activity::ActivityCsvRow;
 use crate::domain::export_batch::StravaExportBatch;
 
-const COL_ACTIVITY_ID: &str = "活动 ID";
-const COL_ACTIVITY_NAME: &str = "活动名称";
-const COL_ACTIVITY_DATE: &str = "活动日期";
-const COL_SOURCE_FILE: &str = "文件名";
+const COL_ACTIVITY_ID: &[&str] = &["活动 ID"];
+const COL_ACTIVITY_NAME: &[&str] = &["活动名称"];
+const COL_ACTIVITY_DATE: &[&str] = &["活动日期"];
+const COL_SOURCE_FILE: &[&str] = &["文件名"];
 
 pub fn discover_batches(inbox_dir: &Path) -> Result<Vec<StravaExportBatch>> {
     if !inbox_dir.exists() {
@@ -84,11 +84,16 @@ pub fn read_activities(csv_path: &Path) -> Result<Vec<ActivityCsvRow>> {
     Ok(rows)
 }
 
-fn header_index(headers: &StringRecord, expected: &str) -> Result<usize> {
+fn header_index(headers: &StringRecord, expected_aliases: &[&str]) -> Result<usize> {
     headers
         .iter()
-        .position(|header| header == expected)
-        .with_context(|| format!("missing required csv column: {expected}"))
+        .position(|header| expected_aliases.iter().any(|alias| header == *alias))
+        .with_context(|| {
+            format!(
+                "missing required csv column: {}",
+                expected_aliases.join(", ")
+            )
+        })
 }
 
 fn is_hidden_path(path: &Path) -> bool {

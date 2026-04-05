@@ -19,10 +19,8 @@ Icon
 /workspace/
 
 # Application State
-# Ignore local database and logs
-/state/activity_index.json
-/state/exports.jsonl
-/state/logs/
+# Ignore all local runtime state
+/state/
 
 # Optional: Keep the state directory structure but ignore files
 # !/state/.gitkeep
