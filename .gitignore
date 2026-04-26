@@ -28,3 +28,6 @@ Icon
 # dev documents
 docs/
 dev.md
+
+# test file
+tests/

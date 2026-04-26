@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
 use std::env;
 
+use crate::db::duckdb_store::DuckActivityStore;
+use crate::db::sqlite::SqliteActivityStore;
 use crate::services;
+use crate::services::fit_schema;
 
 pub fn run() -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
@@ -12,6 +15,8 @@ pub fn run() -> Result<()> {
             let batch = args.get(2).map(String::as_str);
             services::sync::run_sync(&cwd, batch)
         }
+        Some("reingest") => run_reingest(&cwd, args.get(2).map(String::as_str)),
+        Some("db-info") => run_db_info(&cwd),
         Some("scan") => {
             use crate::importers::strava::InboxEntry;
             let entries = crate::importers::strava::discover_inbox(&cwd.join("inbox"))?;
@@ -70,9 +75,105 @@ fn print_help() {
     println!("  cargo run -- sync [batch_name]");
     println!("  cargo run -- scan");
     println!("  cargo run -- export-new [YYYY-MM-DD]");
+    println!("  cargo run -- reingest [activity_id | --all]");
+    println!("  cargo run -- db-info");
     println!();
     println!("Commands:");
-    println!("  sync              Process one inbox batch or all batches when omitted");
+    println!("  sync              Process inbox batches and ingest new FIT files into DuckDB");
     println!("  scan              List valid Strava export batches under inbox/");
     println!("  export-new        Export activities from the latest sync run or from a start date");
+    println!("  reingest          Re-parse a single activity (or --all) into DuckDB");
+    println!("  db-info           Print SQLite + DuckDB schema and row-count summary");
+}
+
+/// `reingest [activity_id | --all]`
+///
+/// Marks the given activity (or all activities) as needing FIT ingestion by
+/// clearing `fit_ingested_at`, then runs the standard ingest pass. The
+/// underlying `ingest_activity` is idempotent (DELETE + Appender), so this
+/// is safe to retry.
+fn run_reingest(cwd: &std::path::Path, arg: Option<&str>) -> Result<()> {
+    let db_path = cwd.join("state/strava.db");
+    let mut store = SqliteActivityStore::open(&db_path)?;
+
+    match arg {
+        None => bail!("reingest requires an <activity_id> or --all"),
+        Some("--all") => {
+            store.clear_all_fit_ingested()?;
+            println!("cleared fit_ingested_at on all activities");
+        }
+        Some(activity_id) => {
+            store.clear_fit_ingested(activity_id)?;
+            println!("cleared fit_ingested_at on activity {activity_id}");
+        }
+    }
+
+    services::sync::run_fit_ingest_pass(cwd, &mut store)
+}
+
+/// `db-info` — quick health snapshot of the analytical pipeline. Does not
+/// modify any state.
+fn run_db_info(cwd: &std::path::Path) -> Result<()> {
+    let sqlite_path = cwd.join("state/strava.db");
+    let store = SqliteActivityStore::open(&sqlite_path)?;
+    let summary = store.fit_ingest_summary()?;
+    println!("SQLite ({})", display_path(cwd, &sqlite_path));
+    println!(
+        "  fit activities : {} total, {} ingested, {} pending",
+        summary.total_fit,
+        summary.ingested,
+        summary.total_fit.saturating_sub(summary.ingested)
+    );
+
+    let duck_path = cwd.join("state/activities.duckdb");
+    if !duck_path.exists() {
+        println!("\nDuckDB ({}) — not yet created", display_path(cwd, &duck_path));
+        return Ok(());
+    }
+    let mut duck = DuckActivityStore::open(&duck_path)?;
+    let conn = duck.conn_mut();
+
+    let profile_version: String = conn
+        .query_row(
+            "SELECT value FROM _schema_meta WHERE key = 'profile_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    println!(
+        "\nDuckDB ({})\n  profile_version : {profile_version}\n  built-in        : {}",
+        display_path(cwd, &duck_path),
+        fit_schema::PROFILE_VERSION
+    );
+
+    println!("  table row counts (non-empty only):");
+    let s = fit_schema::schema();
+    let mut rows: Vec<(String, i64)> = Vec::new();
+    for table_name in s.tables.keys() {
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM \"{table_name}\""),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if n > 0 {
+            rows.push((table_name.clone(), n));
+        }
+    }
+    for aux in ["unknown_fields", "developer_field", "developer_field_value"] {
+        let n: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {aux}"), [], |r| r.get(0))
+            .unwrap_or(0);
+        if n > 0 {
+            rows.push((aux.to_string(), n));
+        }
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let widest = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    for (name, n) in &rows {
+        println!("    {name:<widest$}  {n}");
+    }
+    println!("  ({} non-empty / {} total tables)", rows.len(), s.tables.len() + 3);
+    Ok(())
 }

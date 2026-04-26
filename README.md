@@ -72,6 +72,37 @@ To export from a specific UTC start date, use:
 cargo run -- export-new 2026-04-06
 ```
 
+### 4. 用 SQL 分析活动数据
+### 4. Analyze your activities with SQL
+
+`sync` 完成后，所有 FIT 文件已被解析进 DuckDB（`state/activities.duckdb`），表名与字段命名严格遵循 Garmin FIT Profile（snake_case）。
+After `sync`, every FIT file is parsed into DuckDB at `state/activities.duckdb`. Tables and columns follow the Garmin FIT Profile naming (snake_case).
+
+```bash
+cargo run -- db-info               # SQLite + DuckDB schema / row-count summary
+cargo run -- reingest <id>         # re-parse a single activity
+cargo run -- reingest --all        # re-parse everything (e.g. after Profile bump)
+```
+
+```sql
+-- 通过 DuckDB CLI 或任何 DuckDB 客户端查询 / Query via the DuckDB CLI or any client
+
+-- 心率曲线 / heart-rate trace
+SELECT timestamp, heart_rate, enhanced_speed
+FROM record
+WHERE activity_id = '15337172072'
+ORDER BY timestamp;
+
+-- 跨活动汇总 / cross-activity summary
+SELECT sport, count(*) AS n, AVG(total_distance) AS avg_m
+FROM session
+GROUP BY 1
+ORDER BY n DESC;
+```
+
+> 数据库设计与字段语义详见 [docs/fit-to-duckdb.md](docs/fit-to-duckdb.md).
+> See [docs/fit-to-duckdb.md](docs/fit-to-duckdb.md) for schema rationale.
+
 ---
 
 ## 主要特性 / Key Features
@@ -80,6 +111,8 @@ cargo run -- export-new 2026-04-06
 - **并行处理 (Parallel Processing):** 利用多线程（Rayon）高效处理大量活动文件。
 - **结构化管理 (Structured Library):** 文件名固定为 `{activity_id}__{sanitized_name}.{ext}`，并分类存放。
 - **导出新活动 (Export New):** 默认导出最近一次 `sync` 导入的活动，也支持按 `YYYY-MM-DD` 过滤。
+- **FIT → DuckDB 分析库 (v0.2.0):** 所有 FIT 文件解析进列式数据库，表/字段命名遵循 Garmin FIT Profile，AI Agent / Notebook 可直接用 SQL 分析。
+- **FIT → DuckDB analytics (v0.2.0):** Every FIT message becomes a DuckDB table named after the Garmin FIT Profile, ready for SQL by any agent or notebook.
 
 ---
 

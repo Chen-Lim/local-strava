@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use rayon::prelude::*;
 
+use crate::db::duckdb_store::DuckActivityStore;
 use crate::db::models::{ActivityRecord, SyncRun};
 use crate::db::sqlite::SqliteActivityStore;
 use crate::domain::activity::ActivityCsvRow;
 use crate::domain::export_batch::{ExportLogEntry, StravaExportBatch};
 use crate::importers::strava;
-use crate::services::{consistency, decompress, naming};
+use crate::services::{consistency, decompress, fit_ingest, naming};
 use crate::storage::export_log;
 use crate::utils::fs;
 
@@ -58,7 +59,52 @@ pub fn run_sync(project_root: &Path, batch_name: Option<&str>) -> Result<()> {
         );
     }
 
+    // Phase 2: parse newly-imported FIT files into DuckDB. Runs after every
+    // batch so a partial sync still leaves the analytical DB consistent for
+    // whatever made it through. Failures are logged per activity, never abort.
+    run_fit_ingest_pass(project_root, &mut store)?;
+
     store.complete_sync_run(&sync_run.run_id, &fs::timestamp_rfc3339())?;
+    Ok(())
+}
+
+/// Walk every `pending_fit_ingest()` activity and persist it to the DuckDB
+/// analytical store. Logs per-activity failures to stderr but always returns
+/// `Ok(())` — fit ingestion is opportunistic and shouldn't fail the sync.
+pub fn run_fit_ingest_pass(project_root: &Path, store: &mut SqliteActivityStore) -> Result<()> {
+    let pending = store.pending_fit_ingest()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let duck_path = project_root.join("state/activities.duckdb");
+    let mut duck = DuckActivityStore::open(&duck_path)?;
+    let conn = duck.conn_mut();
+
+    let total = pending.len();
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    println!("FIT ingest: {total} activities pending");
+
+    for record in pending {
+        let fit_path = project_root.join(&record.library_path);
+        match fit_ingest::ingest_activity(conn, &record.activity_id, &fit_path) {
+            Ok(()) => {
+                store.mark_fit_ingested(&record.activity_id, &fs::timestamp_rfc3339())?;
+                ok += 1;
+            }
+            Err(err) => {
+                failed += 1;
+                eprintln!(
+                    "FIT ingest failed for activity {} ({}): {err:#}",
+                    record.activity_id,
+                    fit_path.display()
+                );
+            }
+        }
+    }
+
+    println!("FIT ingest: ok={ok} failed={failed} total={total}");
     Ok(())
 }
 
