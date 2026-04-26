@@ -24,5 +24,7 @@ Icon
 
 # Optional: Keep the state directory structure but ignore files
 # !/state/.gitkeep
-#
+
+# dev documents
+docs/
 dev.md
