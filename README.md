@@ -27,19 +27,22 @@ First, you need to request a full data backup from the Strava website:
 ### 2. 将数据放在哪里
 ### Where to put your data
 
-将下载并解压后的 Strava 导出文件夹放入项目的 `inbox/` 目录中。
-Place the downloaded and extracted Strava export folder into the `inbox/` directory of this project.
+你可以直接把 `export_<id>.zip` 放进 `inbox/`，也可以解压后把 `export_<id>/` 放进去，二者效果一致。
+You can either place the `export_<id>.zip` directly into `inbox/`, or extract it first and place the `export_<id>/` folder — both work identically.
 
 项目目录结构示例 / Example Directory Structure:
 ```text
 Strava/
 ├── inbox/
-│   └── export_12345/       <-- 在这里放置你的 Strava 导出文件夹 / Put your export folder here
-│       ├── activities/     <-- 包含原始活动文件 / Contains raw activity files
-│       └── activities.csv  <-- 活动索引 CSV / Activity index CSV
-├── library/                <-- 处理后的文件将分类存放在这里 / Processed files will be sorted here
-├── state/                  <-- SQLite 状态与日志 / SQLite state and logs
-└── strava-sync             <-- 编译后的可执行文件 / Compiled executable
+│   ├── export_180068918.zip  <-- 直接放入 zip / Place zip directly
+│   └── export_12345/         <-- 或解压后的文件夹 / Or extracted folder
+│       ├── activities/       <-- 包含原始活动文件 / Contains raw activity files
+│       └── activities.csv    <-- 活动索引 CSV / Activity index CSV
+├── library/                  <-- 处理后的文件将分类存放在这里 / Processed files will be sorted here
+├── state/                    <-- SQLite 状态与日志 / SQLite state and logs
+├── workspace/
+│   └── staging/              <-- zip 自动解压到这里 / Zips are auto-extracted here
+└── strava-sync               <-- 编译后的可执行文件 / Compiled executable
 ```
 
 ### 3. 运行同步

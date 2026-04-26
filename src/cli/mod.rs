@@ -13,16 +13,31 @@ pub fn run() -> Result<()> {
             services::sync::run_sync(&cwd, batch)
         }
         Some("scan") => {
-            let batches = crate::importers::strava::discover_batches(&cwd.join("inbox"))?;
-            if batches.is_empty() {
-                println!("No Strava export batches found in inbox/");
+            use crate::importers::strava::InboxEntry;
+            let entries = crate::importers::strava::discover_inbox(&cwd.join("inbox"))?;
+            if entries.is_empty() {
+                println!("No Strava export entries found in inbox/");
             } else {
-                for batch in batches {
-                    println!(
-                        "{} -> {}",
-                        batch.batch_name,
-                        display_path(cwd.as_path(), batch.root.as_path())
-                    );
+                for entry in entries {
+                    match entry {
+                        InboxEntry::Dir(batch) => {
+                            println!(
+                                "{}  [dir]   {}",
+                                batch.batch_name,
+                                display_path(cwd.as_path(), batch.root.as_path())
+                            );
+                        }
+                        InboxEntry::Zip {
+                            batch_name,
+                            zip_path,
+                        } => {
+                            println!(
+                                "{}  [zip]   {}",
+                                batch_name,
+                                display_path(cwd.as_path(), zip_path.as_path())
+                            );
+                        }
+                    }
                 }
             }
             Ok(())

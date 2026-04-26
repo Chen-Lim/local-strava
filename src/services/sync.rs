@@ -74,10 +74,35 @@ fn resolve_batches(
     project_root: &Path,
     requested_batch: Option<&str>,
 ) -> Result<Vec<StravaExportBatch>> {
-    let mut batches = strava::discover_batches(&project_root.join("inbox"))?;
-    if let Some(requested) = requested_batch {
-        batches.retain(|batch| batch.batch_name == requested);
+    use crate::importers::strava::InboxEntry;
+
+    let staging_dir = project_root.join("workspace/staging");
+    let entries = strava::discover_inbox(&project_root.join("inbox"))?;
+
+    let mut batches = Vec::new();
+    for entry in entries {
+        match entry {
+            InboxEntry::Dir(batch) => batches.push(batch),
+            InboxEntry::Zip {
+                batch_name,
+                zip_path,
+            } => {
+                let dest = staging_dir.join(&batch_name);
+                decompress::unzip_strava_archive(&zip_path, &dest)?;
+                batches.push(StravaExportBatch {
+                    batch_name,
+                    root: dest.clone(),
+                    csv_path: dest.join("activities.csv"),
+                    activities_dir: dest.join("activities"),
+                });
+            }
+        }
     }
+
+    if let Some(requested) = requested_batch {
+        batches.retain(|b| b.batch_name == requested);
+    }
+    batches.sort_by(|a, b| a.batch_name.cmp(&b.batch_name));
     Ok(batches)
 }
 
