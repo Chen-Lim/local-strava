@@ -103,6 +103,20 @@ ORDER BY n DESC;
 > 数据库设计与字段语义详见 [docs/fit-to-duckdb.md](docs/fit-to-duckdb.md).
 > See [docs/fit-to-duckdb.md](docs/fit-to-duckdb.md) for schema rationale.
 
+### 5. AI Agent / Claude Skill
+
+本项目包含供 AI Agent (例如 Claude) 自动化分析的专用 CLI：
+This project includes a dedicated CLI for AI Agents (like Claude) to automate analysis:
+
+```bash
+local-strava tables                # 列出所有非空表和行数
+local-strava schema record         # 查看 record 表的列名和类型
+local-strava query "SELECT sport, count(*) FROM session GROUP BY 1" --json
+```
+
+项目自带了 Claude Skill 配置文件 `.claude/skills/local-strava/SKILL.md`。如果你使用支持项目级 Skill 的 Claude 客户端，它将自动读取该文件，并在你提问“分析我最近的跑步数据”时，主动通过 `local-strava query` 编写 SQL 进行深度分析。
+The project includes a Claude Skill configuration at `.claude/skills/local-strava/SKILL.md`. Compatible Claude clients will automatically load this skill and can proactively write SQL via `local-strava query` to deeply analyze your data when you ask questions like "analyze my recent runs".
+
 ---
 
 ## 主要特性 / Key Features
@@ -111,6 +125,7 @@ ORDER BY n DESC;
 - **并行处理 (Parallel Processing):** 利用多线程（Rayon）高效处理大量活动文件。
 - **结构化管理 (Structured Library):** 文件名固定为 `{activity_id}__{sanitized_name}.{ext}`，并分类存放。
 - **导出新活动 (Export New):** 默认导出最近一次 `sync` 导入的活动，也支持按 `YYYY-MM-DD` 过滤。
+- **Agent-ready CLI (v0.2.1):** 包含 `query`、`tables`、`schema` 等专门为 AI Agent 打造的数据抓取命令，并自带 Claude Skill 供 LLM 自动化分析数据。
 - **FIT → DuckDB 分析库 (v0.2.0):** 所有 FIT 文件解析进列式数据库，表/字段命名遵循 Garmin FIT Profile，AI Agent / Notebook 可直接用 SQL 分析。
 - **FIT → DuckDB analytics (v0.2.0):** Every FIT message becomes a DuckDB table named after the Garmin FIT Profile, ready for SQL by any agent or notebook.
 

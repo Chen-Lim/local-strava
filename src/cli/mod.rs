@@ -51,6 +51,38 @@ pub fn run() -> Result<()> {
             let since = args.get(2).map(String::as_str);
             services::export::export_new(&cwd, since)
         }
+        Some("tables") => run_tables(&cwd),
+        Some("schema") => {
+            let table = args.get(2).map(String::as_str);
+            run_schema(&cwd, table)
+        }
+        Some("query") => {
+            let is_json = args.iter().any(|a| a == "--json");
+            let limit = args
+                .iter()
+                .position(|a| a == "--limit")
+                .and_then(|pos| args.get(pos + 1))
+                .and_then(|v| v.parse::<usize>().ok());
+            
+            let mut sql = None;
+            let mut skip_next = false;
+            for arg in args.iter().skip(2) {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if arg == "--json" {
+                    continue;
+                }
+                if arg == "--limit" {
+                    skip_next = true;
+                    continue;
+                }
+                sql = Some(arg.as_str());
+                break;
+            }
+            run_query(&cwd, sql, is_json, limit)
+        }
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
             Ok(())
@@ -77,6 +109,9 @@ fn print_help() {
     println!("  cargo run -- export-new [YYYY-MM-DD]");
     println!("  cargo run -- reingest [activity_id | --all]");
     println!("  cargo run -- db-info");
+    println!("  cargo run -- tables");
+    println!("  cargo run -- schema <table>");
+    println!("  cargo run -- query <SQL> [--json] [--limit N]");
     println!();
     println!("Commands:");
     println!("  sync              Process inbox batches and ingest new FIT files into DuckDB");
@@ -84,6 +119,9 @@ fn print_help() {
     println!("  export-new        Export activities from the latest sync run or from a start date");
     println!("  reingest          Re-parse a single activity (or --all) into DuckDB");
     println!("  db-info           Print SQLite + DuckDB schema and row-count summary");
+    println!("  tables            List non-empty DuckDB tables and row counts");
+    println!("  schema            Print schema (columns, types) for a specific DuckDB table");
+    println!("  query             Run a SQL query against DuckDB and output as CSV or JSON");
 }
 
 /// `reingest [activity_id | --all]`
@@ -176,4 +214,223 @@ fn run_db_info(cwd: &std::path::Path) -> Result<()> {
     }
     println!("  ({} non-empty / {} total tables)", rows.len(), s.tables.len() + 3);
     Ok(())
+}
+
+/// `tables` — list non-empty tables and their row counts.
+fn run_tables(cwd: &std::path::Path) -> Result<()> {
+    let duck_path = cwd.join("state/activities.duckdb");
+    if !duck_path.exists() {
+        bail!("DuckDB not found at {}", duck_path.display());
+    }
+    let mut duck = DuckActivityStore::open(&duck_path)?;
+    let conn = duck.conn_mut();
+
+    let s = fit_schema::schema();
+    let mut rows: Vec<(String, i64)> = Vec::new();
+    for table_name in s.tables.keys() {
+        let n: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM \"{table_name}\""), [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        if n > 0 {
+            rows.push((table_name.clone(), n));
+        }
+    }
+    for aux in ["unknown_fields", "developer_field", "developer_field_value"] {
+        let n: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {aux}"), [], |r| r.get(0))
+            .unwrap_or(0);
+        if n > 0 {
+            rows.push((aux.to_string(), n));
+        }
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    for (name, n) in rows {
+        println!("{name}\t{n}");
+    }
+    Ok(())
+}
+
+/// `schema <table>` — print columns, types, and flags for a specific table.
+fn run_schema(cwd: &std::path::Path, table_name: Option<&str>) -> Result<()> {
+    let table_name = table_name.context("schema requires a table name")?;
+    
+    let duck_path = cwd.join("state/activities.duckdb");
+    if !duck_path.exists() {
+        bail!("DuckDB not found at {}", duck_path.display());
+    }
+
+    let s = fit_schema::schema();
+    
+    // For standard profile tables
+    if let Some(table) = s.table(table_name) {
+        println!("column_name,type,is_semicircle,is_array");
+        println!("activity_id,VARCHAR,false,false");
+        println!("mesg_index,INTEGER,false,false");
+        for c in &table.columns {
+            println!(
+                "{},{},{},{}",
+                c.name,
+                c.sql_type.sql_str(),
+                c.is_semicircle,
+                c.is_array
+            );
+        }
+        return Ok(());
+    }
+
+    // For aux tables (query sqlite master or simply return structure)
+    // To be robust, we can just query the schema from DuckDB directly
+    let mut duck = DuckActivityStore::open(&duck_path)?;
+    let conn = duck.conn_mut();
+    let stmt = conn.prepare(&format!("SELECT * FROM \"{table_name}\" LIMIT 0"))
+        .with_context(|| format!("Table '{table_name}' not found or invalid"))?;
+    
+    // Check if table exists and drop stmt to free locks
+    drop(stmt);
+
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table_name}\")"))?;
+    let mut rows = stmt.query([])?;
+    println!("column_name,type,is_semicircle,is_array");
+    while let Ok(Some(row)) = rows.next() {
+        let name: String = row.get(1)?;
+        let typ: String = row.get(2)?;
+        println!("{},{},false,false", name, typ);
+    }
+    Ok(())
+}
+
+/// `query <SQL>` — run a query and output CSV or JSON.
+fn run_query(
+    cwd: &std::path::Path,
+    sql: Option<&str>,
+    json: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    let mut sql = sql.context("query requires a SQL string")?.to_string();
+
+    let duck_path = cwd.join("state/activities.duckdb");
+    if !duck_path.exists() {
+        bail!("DuckDB not found at {}", duck_path.display());
+    }
+
+    let mut duck = DuckActivityStore::open(&duck_path)?;
+    let conn = duck.conn_mut();
+
+    if let Some(l) = limit {
+        sql = format!("SELECT * FROM ({}) LIMIT {}", sql, l);
+    }
+
+    let col_names = {
+        // Execute a LIMIT 0 wrapper to safely fetch the schema and column names
+        // without keeping the statement borrowed or exhausting rows.
+        let mut stmt0 = conn.prepare(&format!("SELECT * FROM ({}) LIMIT 0", sql))?;
+        stmt0.execute([])?;
+        stmt0.column_names()
+    };
+    let col_count = col_names.len();
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        eprintln!("SQL Error: {}", e);
+        std::process::exit(1);
+    })?;
+
+    let mut rows = stmt.query([]).map_err(|e| {
+        eprintln!("Execution Error: {}", e);
+        std::process::exit(1);
+    })?;
+
+    if json {
+        println!("[");
+        let mut first = true;
+        while let Ok(Some(row)) = rows.next() {
+            if !first {
+                println!(",");
+            } else {
+                first = false;
+            }
+            let mut map = serde_json::Map::new();
+            for i in 0..col_count {
+                let val: duckdb::types::Value = row.get(i).unwrap_or(duckdb::types::Value::Null);
+                map.insert(col_names[i].clone(), duck_to_json(val));
+            }
+            print!("  {}", serde_json::Value::Object(map).to_string());
+        }
+        println!("\n]");
+    } else {
+        let mut wtr = csv::Writer::from_writer(std::io::stdout());
+        wtr.write_record(&col_names)?;
+        while let Ok(Some(row)) = rows.next() {
+            let mut record = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let val: duckdb::types::Value = row.get(i).unwrap_or(duckdb::types::Value::Null);
+                record.push(duck_to_string(val));
+            }
+            wtr.write_record(&record)?;
+        }
+        wtr.flush()?;
+    }
+
+    Ok(())
+}
+
+fn duck_to_string(val: duckdb::types::Value) -> String {
+    use duckdb::types::Value;
+    match val {
+        Value::Null => String::new(),
+        Value::Boolean(b) => b.to_string(),
+        Value::TinyInt(i) => i.to_string(),
+        Value::SmallInt(i) => i.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Text(s) => s,
+        Value::Timestamp(tu, v) => {
+            // DuckDB timestamp is typically microseconds, but TimeUnit tells us.
+            let (secs, nanos) = match tu {
+                duckdb::types::TimeUnit::Second => (v, 0),
+                duckdb::types::TimeUnit::Millisecond => (v / 1000, (v % 1000) as u32 * 1_000_000),
+                duckdb::types::TimeUnit::Microsecond => (v / 1_000_000, (v % 1_000_000) as u32 * 1_000),
+                duckdb::types::TimeUnit::Nanosecond => (v / 1_000_000_000, (v % 1_000_000_000) as u32),
+            };
+            chrono::DateTime::from_timestamp(secs, nanos)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| "Invalid Timestamp".to_string())
+        }
+        Value::HugeInt(v) => v.to_string(),
+        Value::Blob(b) => format!("{:?}", b), // fallback for Blob
+        _ => format!("{:?}", val),
+    }
+}
+
+fn duck_to_json(val: duckdb::types::Value) -> serde_json::Value {
+    use duckdb::types::Value;
+    match val {
+        Value::Null => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(b),
+        Value::TinyInt(i) => serde_json::json!(i),
+        Value::SmallInt(i) => serde_json::json!(i),
+        Value::Int(i) => serde_json::json!(i),
+        Value::BigInt(i) => serde_json::json!(i),
+        Value::Float(f) => serde_json::json!(f),
+        Value::Double(d) => serde_json::json!(d),
+        Value::Text(s) => serde_json::Value::String(s),
+        Value::Timestamp(tu, v) => {
+            let (secs, nanos) = match tu {
+                duckdb::types::TimeUnit::Second => (v, 0),
+                duckdb::types::TimeUnit::Millisecond => (v / 1000, (v % 1000) as u32 * 1_000_000),
+                duckdb::types::TimeUnit::Microsecond => (v / 1_000_000, (v % 1_000_000) as u32 * 1_000),
+                duckdb::types::TimeUnit::Nanosecond => (v / 1_000_000_000, (v % 1_000_000_000) as u32),
+            };
+            if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
+                serde_json::Value::String(dt.to_rfc3339())
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        Value::HugeInt(v) => serde_json::json!(v.to_string()),
+        _ => serde_json::Value::String(format!("{:?}", val)),
+    }
 }

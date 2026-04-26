@@ -1,6 +1,6 @@
 [package]
-name = "local-strava"
-version = "0.2.0"
+name = "strata"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
