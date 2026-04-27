@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -9,18 +9,22 @@ use crate::db::sqlite::SqliteActivityStore;
 use crate::domain::activity::ActivityCsvRow;
 use crate::domain::export_batch::{ExportLogEntry, StravaExportBatch};
 use crate::importers::strava;
-use crate::services::{consistency, decompress, fit_ingest, naming};
+use crate::services::{decompress, fit_ingest, layout, naming};
 use crate::storage::export_log;
 use crate::utils::fs;
 
 pub fn run_sync(project_root: &Path, batch_name: Option<&str>) -> Result<()> {
-    consistency::ensure_project_layout(project_root)?;
-    let db_path = project_root.join("state/strava.db");
+    layout::warn_if_legacy_state(project_root);
+    layout::ensure_sync_layout(project_root)?;
+    let db_path = layout::sqlite_path(project_root);
     let mut store = SqliteActivityStore::open(&db_path)?;
     let batches = resolve_batches(project_root, batch_name)?;
 
     if batches.is_empty() {
-        println!("No valid Strava export batches found in inbox/");
+        println!(
+            "No valid Strava export batches (export_*.zip or export_*/) found in {}",
+            project_root.display()
+        );
         return Ok(());
     }
 
@@ -37,7 +41,7 @@ pub fn run_sync(project_root: &Path, batch_name: Option<&str>) -> Result<()> {
 
         let batch_name = summary.batch_name.clone();
         export_log::append(
-            &project_root.join("state/exports.jsonl"),
+            &layout::exports_log_path(project_root),
             &ExportLogEntry {
                 run_id: sync_run.run_id.clone(),
                 batch_name,
@@ -77,7 +81,7 @@ pub fn run_fit_ingest_pass(project_root: &Path, store: &mut SqliteActivityStore)
         return Ok(());
     }
 
-    let duck_path = project_root.join("state/activities.duckdb");
+    let duck_path = layout::duckdb_path(project_root);
     let mut duck = DuckActivityStore::open(&duck_path)?;
     let conn = duck.conn_mut();
 
@@ -122,8 +126,8 @@ fn resolve_batches(
 ) -> Result<Vec<StravaExportBatch>> {
     use crate::importers::strava::InboxEntry;
 
-    let staging_dir = project_root.join("workspace/staging");
-    let entries = strava::discover_inbox(&project_root.join("inbox"))?;
+    let staging_dir = layout::staging_dir(project_root);
+    let entries = strava::discover_exports(project_root)?;
 
     let mut batches = Vec::new();
     for entry in entries {
@@ -167,8 +171,6 @@ fn process_batch(
         .collect();
     let skipped_activities = total_rows.saturating_sub(pending.len());
 
-    ensure_library_dirs(project_root)?;
-
     let results: Vec<Result<Option<ActivityRecord>, String>> = pending
         .into_par_iter()
         .map(|row| {
@@ -186,7 +188,7 @@ fn process_batch(
                 None => return Err(format!("Unsupported export file: {}", row.source_basename)),
             };
 
-            let dest_dir = library_dir_for_extension(project_root, extension);
+            let dest_dir = layout::library_dir_for_extension(project_root, extension);
             let sanitized_name = naming::sanitize_filename(&row.activity_name);
             let dest_path = fs::deterministic_activity_path(
                 &dest_dir,
@@ -246,26 +248,6 @@ fn process_batch(
     };
 
     Ok((summary, new_records))
-}
-
-fn ensure_library_dirs(project_root: &Path) -> Result<()> {
-    for dir in [
-        project_root.join("library/activities/fit"),
-        project_root.join("library/activities/tcx"),
-        project_root.join("library/activities/gpx"),
-    ] {
-        fs::ensure_dir(&dir)?;
-    }
-    Ok(())
-}
-
-fn library_dir_for_extension(project_root: &Path, extension: &str) -> PathBuf {
-    match extension {
-        ".fit" => project_root.join("library/activities/fit"),
-        ".tcx" => project_root.join("library/activities/tcx"),
-        ".gpx" => project_root.join("library/activities/gpx"),
-        _ => project_root.join("library/activities"),
-    }
 }
 
 fn relative_to_root(project_root: &Path, path: &Path) -> String {

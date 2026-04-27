@@ -1,146 +1,139 @@
 use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
 use std::env;
+use std::path::Path;
 
 use crate::db::duckdb_store::DuckActivityStore;
 use crate::db::sqlite::SqliteActivityStore;
 use crate::services;
-use crate::services::fit_schema;
+use crate::services::{fit_schema, layout};
+
+#[derive(Parser)]
+#[command(
+    name = "strata",
+    version,
+    about = "Local Strava analytics — runs in the current directory"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Process Strava export batches in the cwd and ingest new FIT files into DuckDB.
+    Sync {
+        /// Restrict to a specific batch name (defaults to all).
+        batch: Option<String>,
+    },
+    /// List valid Strava export batches (export_*.zip / export_*/) in the cwd.
+    Scan,
+    /// Copy activities from the latest sync (or since YYYY-MM-DD) into ./new/.
+    ExportNew {
+        /// YYYY-MM-DD start date; defaults to the latest completed sync run.
+        since: Option<String>,
+    },
+    /// Re-parse a single activity (or --all) into DuckDB.
+    Reingest {
+        /// Activity id to reingest. Omit when using --all.
+        activity_id: Option<String>,
+        /// Reingest every activity.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Print SQLite + DuckDB schema and row-count summary.
+    DbInfo,
+    /// List non-empty DuckDB tables and row counts.
+    Tables,
+    /// Print schema (columns, types) for a specific DuckDB table.
+    Schema {
+        table: String,
+    },
+    /// Run a SQL query against DuckDB and output as CSV or JSON.
+    Query {
+        sql: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
 
 pub fn run() -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
-    let args: Vec<String> = env::args().collect();
+    let cli = Cli::parse();
+    let cmd = cli.command.unwrap_or(Cmd::Sync { batch: None });
 
-    match args.get(1).map(String::as_str) {
-        None | Some("sync") => {
-            let batch = args.get(2).map(String::as_str);
-            services::sync::run_sync(&cwd, batch)
-        }
-        Some("reingest") => run_reingest(&cwd, args.get(2).map(String::as_str)),
-        Some("db-info") => run_db_info(&cwd),
-        Some("scan") => {
-            use crate::importers::strava::InboxEntry;
-            let entries = crate::importers::strava::discover_inbox(&cwd.join("inbox"))?;
-            if entries.is_empty() {
-                println!("No Strava export entries found in inbox/");
-            } else {
-                for entry in entries {
-                    match entry {
-                        InboxEntry::Dir(batch) => {
-                            println!(
-                                "{}  [dir]   {}",
-                                batch.batch_name,
-                                display_path(cwd.as_path(), batch.root.as_path())
-                            );
-                        }
-                        InboxEntry::Zip {
-                            batch_name,
-                            zip_path,
-                        } => {
-                            println!(
-                                "{}  [zip]   {}",
-                                batch_name,
-                                display_path(cwd.as_path(), zip_path.as_path())
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-        Some("export-new") => {
-            let since = args.get(2).map(String::as_str);
-            services::export::export_new(&cwd, since)
-        }
-        Some("tables") => run_tables(&cwd),
-        Some("schema") => {
-            let table = args.get(2).map(String::as_str);
-            run_schema(&cwd, table)
-        }
-        Some("query") => {
-            let is_json = args.iter().any(|a| a == "--json");
-            let limit = args
-                .iter()
-                .position(|a| a == "--limit")
-                .and_then(|pos| args.get(pos + 1))
-                .and_then(|v| v.parse::<usize>().ok());
-            
-            let mut sql = None;
-            let mut skip_next = false;
-            for arg in args.iter().skip(2) {
-                if skip_next {
-                    skip_next = false;
-                    continue;
-                }
-                if arg == "--json" {
-                    continue;
-                }
-                if arg == "--limit" {
-                    skip_next = true;
-                    continue;
-                }
-                sql = Some(arg.as_str());
-                break;
-            }
-            run_query(&cwd, sql, is_json, limit)
-        }
-        Some("help") | Some("--help") | Some("-h") => {
-            print_help();
-            Ok(())
-        }
-        Some(other) => {
-            bail!("unknown command: {other}")
-        }
+    match cmd {
+        Cmd::Sync { batch } => services::sync::run_sync(&cwd, batch.as_deref()),
+        Cmd::Scan => run_scan(&cwd),
+        Cmd::ExportNew { since } => services::export::export_new(&cwd, since.as_deref()),
+        Cmd::Reingest { activity_id, all } => run_reingest(&cwd, activity_id.as_deref(), all),
+        Cmd::DbInfo => run_db_info(&cwd),
+        Cmd::Tables => run_tables(&cwd),
+        Cmd::Schema { table } => run_schema(&cwd, &table),
+        Cmd::Query { sql, json, limit } => run_query(&cwd, &sql, json, limit),
     }
 }
 
-fn display_path(root: &std::path::Path, path: &std::path::Path) -> String {
+fn run_scan(cwd: &Path) -> Result<()> {
+    use crate::importers::strava::InboxEntry;
+    let entries = crate::importers::strava::discover_exports(cwd)?;
+    if entries.is_empty() {
+        println!(
+            "No Strava export batches (export_*.zip or export_*/) found in {}",
+            cwd.display()
+        );
+    } else {
+        for entry in entries {
+            match entry {
+                InboxEntry::Dir(batch) => {
+                    println!(
+                        "{}  [dir]   {}",
+                        batch.batch_name,
+                        display_path(cwd, batch.root.as_path())
+                    );
+                }
+                InboxEntry::Zip {
+                    batch_name,
+                    zip_path,
+                } => {
+                    println!(
+                        "{}  [zip]   {}",
+                        batch_name,
+                        display_path(cwd, zip_path.as_path())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
 }
 
-fn print_help() {
-    println!("strava-sync");
-    println!();
-    println!("Usage:");
-    println!("  cargo run -- sync [batch_name]");
-    println!("  cargo run -- scan");
-    println!("  cargo run -- export-new [YYYY-MM-DD]");
-    println!("  cargo run -- reingest [activity_id | --all]");
-    println!("  cargo run -- db-info");
-    println!("  cargo run -- tables");
-    println!("  cargo run -- schema <table>");
-    println!("  cargo run -- query <SQL> [--json] [--limit N]");
-    println!();
-    println!("Commands:");
-    println!("  sync              Process inbox batches and ingest new FIT files into DuckDB");
-    println!("  scan              List valid Strava export batches under inbox/");
-    println!("  export-new        Export activities from the latest sync run or from a start date");
-    println!("  reingest          Re-parse a single activity (or --all) into DuckDB");
-    println!("  db-info           Print SQLite + DuckDB schema and row-count summary");
-    println!("  tables            List non-empty DuckDB tables and row counts");
-    println!("  schema            Print schema (columns, types) for a specific DuckDB table");
-    println!("  query             Run a SQL query against DuckDB and output as CSV or JSON");
-}
-
-/// `reingest [activity_id | --all]`
-///
 /// Marks the given activity (or all activities) as needing FIT ingestion by
 /// clearing `fit_ingested_at`, then runs the standard ingest pass. The
 /// underlying `ingest_activity` is idempotent (DELETE + Appender), so this
 /// is safe to retry.
-fn run_reingest(cwd: &std::path::Path, arg: Option<&str>) -> Result<()> {
-    let db_path = cwd.join("state/strava.db");
+fn run_reingest(cwd: &Path, activity_id: Option<&str>, all: bool) -> Result<()> {
+    layout::warn_if_legacy_state(cwd);
+    layout::ensure_sync_layout(cwd)?;
+    let db_path = layout::sqlite_path(cwd);
     let mut store = SqliteActivityStore::open(&db_path)?;
 
-    match arg {
-        None => bail!("reingest requires an <activity_id> or --all"),
-        Some("--all") => {
+    match (activity_id, all) {
+        (None, false) => bail!("reingest requires an <activity_id> or --all"),
+        (_, true) => {
             store.clear_all_fit_ingested()?;
             println!("cleared fit_ingested_at on all activities");
         }
-        Some(activity_id) => {
+        (Some(activity_id), false) => {
             store.clear_fit_ingested(activity_id)?;
             println!("cleared fit_ingested_at on activity {activity_id}");
         }
@@ -149,10 +142,17 @@ fn run_reingest(cwd: &std::path::Path, arg: Option<&str>) -> Result<()> {
     services::sync::run_fit_ingest_pass(cwd, &mut store)
 }
 
-/// `db-info` — quick health snapshot of the analytical pipeline. Does not
-/// modify any state.
-fn run_db_info(cwd: &std::path::Path) -> Result<()> {
-    let sqlite_path = cwd.join("state/strava.db");
+/// `db-info` — quick health snapshot of the analytical pipeline. Read-only;
+/// does not create directories or files.
+fn run_db_info(cwd: &Path) -> Result<()> {
+    let sqlite_path = layout::sqlite_path(cwd);
+    if !sqlite_path.exists() {
+        bail!(
+            "{} not found in {} — run `strata sync` first",
+            sqlite_path.file_name().unwrap().to_string_lossy(),
+            cwd.display()
+        );
+    }
     let store = SqliteActivityStore::open(&sqlite_path)?;
     let summary = store.fit_ingest_summary()?;
     println!("SQLite ({})", display_path(cwd, &sqlite_path));
@@ -163,7 +163,7 @@ fn run_db_info(cwd: &std::path::Path) -> Result<()> {
         summary.total_fit.saturating_sub(summary.ingested)
     );
 
-    let duck_path = cwd.join("state/activities.duckdb");
+    let duck_path = layout::duckdb_path(cwd);
     if !duck_path.exists() {
         println!("\nDuckDB ({}) — not yet created", display_path(cwd, &duck_path));
         return Ok(());
@@ -217,10 +217,14 @@ fn run_db_info(cwd: &std::path::Path) -> Result<()> {
 }
 
 /// `tables` — list non-empty tables and their row counts.
-fn run_tables(cwd: &std::path::Path) -> Result<()> {
-    let duck_path = cwd.join("state/activities.duckdb");
+fn run_tables(cwd: &Path) -> Result<()> {
+    let duck_path = layout::duckdb_path(cwd);
     if !duck_path.exists() {
-        bail!("DuckDB not found at {}", duck_path.display());
+        bail!(
+            "{} not found in {} — run `strata sync` first",
+            duck_path.file_name().unwrap().to_string_lossy(),
+            cwd.display()
+        );
     }
     let mut duck = DuckActivityStore::open(&duck_path)?;
     let conn = duck.conn_mut();
@@ -253,17 +257,18 @@ fn run_tables(cwd: &std::path::Path) -> Result<()> {
 }
 
 /// `schema <table>` — print columns, types, and flags for a specific table.
-fn run_schema(cwd: &std::path::Path, table_name: Option<&str>) -> Result<()> {
-    let table_name = table_name.context("schema requires a table name")?;
-    
-    let duck_path = cwd.join("state/activities.duckdb");
+fn run_schema(cwd: &Path, table_name: &str) -> Result<()> {
+    let duck_path = layout::duckdb_path(cwd);
     if !duck_path.exists() {
-        bail!("DuckDB not found at {}", duck_path.display());
+        bail!(
+            "{} not found in {} — run `strata sync` first",
+            duck_path.file_name().unwrap().to_string_lossy(),
+            cwd.display()
+        );
     }
 
     let s = fit_schema::schema();
-    
-    // For standard profile tables
+
     if let Some(table) = s.table(table_name) {
         println!("column_name,type,is_semicircle,is_array");
         println!("activity_id,VARCHAR,false,false");
@@ -280,14 +285,11 @@ fn run_schema(cwd: &std::path::Path, table_name: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    // For aux tables (query sqlite master or simply return structure)
-    // To be robust, we can just query the schema from DuckDB directly
     let mut duck = DuckActivityStore::open(&duck_path)?;
     let conn = duck.conn_mut();
-    let stmt = conn.prepare(&format!("SELECT * FROM \"{table_name}\" LIMIT 0"))
+    let stmt = conn
+        .prepare(&format!("SELECT * FROM \"{table_name}\" LIMIT 0"))
         .with_context(|| format!("Table '{table_name}' not found or invalid"))?;
-    
-    // Check if table exists and drop stmt to free locks
     drop(stmt);
 
     let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table_name}\")"))?;
@@ -302,29 +304,25 @@ fn run_schema(cwd: &std::path::Path, table_name: Option<&str>) -> Result<()> {
 }
 
 /// `query <SQL>` — run a query and output CSV or JSON.
-fn run_query(
-    cwd: &std::path::Path,
-    sql: Option<&str>,
-    json: bool,
-    limit: Option<usize>,
-) -> Result<()> {
-    let mut sql = sql.context("query requires a SQL string")?.to_string();
-
-    let duck_path = cwd.join("state/activities.duckdb");
+fn run_query(cwd: &Path, sql: &str, json: bool, limit: Option<usize>) -> Result<()> {
+    let duck_path = layout::duckdb_path(cwd);
     if !duck_path.exists() {
-        bail!("DuckDB not found at {}", duck_path.display());
+        bail!(
+            "{} not found in {} — run `strata sync` first",
+            duck_path.file_name().unwrap().to_string_lossy(),
+            cwd.display()
+        );
     }
 
     let mut duck = DuckActivityStore::open(&duck_path)?;
     let conn = duck.conn_mut();
 
+    let mut sql = sql.to_string();
     if let Some(l) = limit {
         sql = format!("SELECT * FROM ({}) LIMIT {}", sql, l);
     }
 
     let col_names = {
-        // Execute a LIMIT 0 wrapper to safely fetch the schema and column names
-        // without keeping the statement borrowed or exhausting rows.
         let mut stmt0 = conn.prepare(&format!("SELECT * FROM ({}) LIMIT 0", sql))?;
         stmt0.execute([])?;
         stmt0.column_names()
@@ -388,19 +386,22 @@ fn duck_to_string(val: duckdb::types::Value) -> String {
         Value::Double(d) => d.to_string(),
         Value::Text(s) => s,
         Value::Timestamp(tu, v) => {
-            // DuckDB timestamp is typically microseconds, but TimeUnit tells us.
             let (secs, nanos) = match tu {
                 duckdb::types::TimeUnit::Second => (v, 0),
                 duckdb::types::TimeUnit::Millisecond => (v / 1000, (v % 1000) as u32 * 1_000_000),
-                duckdb::types::TimeUnit::Microsecond => (v / 1_000_000, (v % 1_000_000) as u32 * 1_000),
-                duckdb::types::TimeUnit::Nanosecond => (v / 1_000_000_000, (v % 1_000_000_000) as u32),
+                duckdb::types::TimeUnit::Microsecond => {
+                    (v / 1_000_000, (v % 1_000_000) as u32 * 1_000)
+                }
+                duckdb::types::TimeUnit::Nanosecond => {
+                    (v / 1_000_000_000, (v % 1_000_000_000) as u32)
+                }
             };
             chrono::DateTime::from_timestamp(secs, nanos)
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_else(|| "Invalid Timestamp".to_string())
         }
         Value::HugeInt(v) => v.to_string(),
-        Value::Blob(b) => format!("{:?}", b), // fallback for Blob
+        Value::Blob(b) => format!("{:?}", b),
         _ => format!("{:?}", val),
     }
 }
@@ -421,8 +422,12 @@ fn duck_to_json(val: duckdb::types::Value) -> serde_json::Value {
             let (secs, nanos) = match tu {
                 duckdb::types::TimeUnit::Second => (v, 0),
                 duckdb::types::TimeUnit::Millisecond => (v / 1000, (v % 1000) as u32 * 1_000_000),
-                duckdb::types::TimeUnit::Microsecond => (v / 1_000_000, (v % 1_000_000) as u32 * 1_000),
-                duckdb::types::TimeUnit::Nanosecond => (v / 1_000_000_000, (v % 1_000_000_000) as u32),
+                duckdb::types::TimeUnit::Microsecond => {
+                    (v / 1_000_000, (v % 1_000_000) as u32 * 1_000)
+                }
+                duckdb::types::TimeUnit::Nanosecond => {
+                    (v / 1_000_000_000, (v % 1_000_000_000) as u32)
+                }
             };
             if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
                 serde_json::Value::String(dt.to_rfc3339())

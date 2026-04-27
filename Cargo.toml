@@ -1,6 +1,6 @@
 [package]
 name = "strata"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 fitparser = "0.10"
 duckdb = { version = "1", features = ["bundled"] }
 indexmap = { version = "2", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

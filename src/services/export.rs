@@ -4,13 +4,14 @@ use anyhow::{Context, Result};
 use chrono::{NaiveDate, TimeZone, Utc};
 
 use crate::db::sqlite::SqliteActivityStore;
-use crate::services::consistency;
+use crate::services::layout;
 use crate::utils::fs;
 
 pub fn export_new(project_root: &Path, since: Option<&str>) -> Result<()> {
-    consistency::ensure_project_layout(project_root)?;
+    layout::warn_if_legacy_state(project_root);
+    layout::ensure_export_layout(project_root)?;
 
-    let db_path = project_root.join("state/strava.db");
+    let db_path = layout::sqlite_path(project_root);
     let store = SqliteActivityStore::open(&db_path)?;
 
     let records = match since {
@@ -32,8 +33,7 @@ pub fn export_new(project_root: &Path, since: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    let new_dir = project_root.join("new");
-    fs::ensure_dir(&new_dir)?;
+    let new_dir = layout::new_dir(project_root);
 
     for record in &records {
         let file_name = Path::new(&record.library_path)

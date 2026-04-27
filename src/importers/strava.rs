@@ -13,7 +13,7 @@ const COL_ACTIVITY_NAME: &[&str] = &["活动名称"];
 const COL_ACTIVITY_DATE: &[&str] = &["活动日期"];
 const COL_SOURCE_FILE: &[&str] = &["文件名"];
 
-/// An entry discovered in the inbox directory.
+/// An entry discovered in the scan directory (cwd).
 #[derive(Debug)]
 pub enum InboxEntry {
     Dir(StravaExportBatch),
@@ -32,17 +32,20 @@ impl InboxEntry {
     }
 }
 
-/// Discover all valid inbox entries (both directories and zip archives).
+/// Discover all valid Strava export entries (both directories and zip archives)
+/// directly in `scan_dir`. Only names starting with `export_` are considered, so
+/// internal directories like `library/`, `archive/`, `workspace/`, `new/` and
+/// `.strata/` are never picked up.
 ///
 /// When the same `batch_name` exists as both a directory and a zip, the
 /// directory takes priority (the zip is ignored with an info message).
-pub fn discover_inbox(inbox_dir: &Path) -> Result<Vec<InboxEntry>> {
-    if !inbox_dir.exists() {
+pub fn discover_exports(scan_dir: &Path) -> Result<Vec<InboxEntry>> {
+    if !scan_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let dir_entries = discover_dir_entries(inbox_dir)?;
-    let zip_entries = discover_zip_entries(inbox_dir)?;
+    let dir_entries = discover_dir_entries(scan_dir)?;
+    let zip_entries = discover_zip_entries(scan_dir)?;
 
     // Collect dir batch names for conflict resolution (owned to avoid borrow conflict).
     let dir_names: HashSet<String> = dir_entries
@@ -70,8 +73,8 @@ pub fn discover_inbox(inbox_dir: &Path) -> Result<Vec<InboxEntry>> {
 
 /// Backward-compatible: discover only directory-based batches.
 #[allow(dead_code)]
-pub fn discover_batches(inbox_dir: &Path) -> Result<Vec<StravaExportBatch>> {
-    let entries = discover_inbox(inbox_dir)?;
+pub fn discover_batches(scan_dir: &Path) -> Result<Vec<StravaExportBatch>> {
+    let entries = discover_exports(scan_dir)?;
     let batches = entries
         .into_iter()
         .filter_map(|e| match e {
@@ -83,13 +86,18 @@ pub fn discover_batches(inbox_dir: &Path) -> Result<Vec<StravaExportBatch>> {
 }
 
 /// Scan for directory-based Strava export batches.
-fn discover_dir_entries(inbox_dir: &Path) -> Result<Vec<InboxEntry>> {
+fn discover_dir_entries(scan_dir: &Path) -> Result<Vec<InboxEntry>> {
     let mut entries = Vec::new();
-    for entry in fs::read_dir(inbox_dir).context("failed to read inbox directory")? {
-        let entry = entry.context("failed to read inbox entry")?;
+    for entry in fs::read_dir(scan_dir).context("failed to read scan directory")? {
+        let entry = entry.context("failed to read directory entry")?;
         let path = entry.path();
 
         if !path.is_dir() || is_hidden_path(path.as_path()) {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("export_") {
             continue;
         }
 
@@ -108,21 +116,22 @@ fn discover_dir_entries(inbox_dir: &Path) -> Result<Vec<InboxEntry>> {
 }
 
 /// Scan for zip-based Strava export archives with lightweight validation.
-fn discover_zip_entries(inbox_dir: &Path) -> Result<Vec<InboxEntry>> {
+fn discover_zip_entries(scan_dir: &Path) -> Result<Vec<InboxEntry>> {
     let mut entries = Vec::new();
-    for entry in fs::read_dir(inbox_dir).context("failed to read inbox directory")? {
-        let entry = entry.context("failed to read inbox entry")?;
+    for entry in fs::read_dir(scan_dir).context("failed to read scan directory")? {
+        let entry = entry.context("failed to read directory entry")?;
         let path = entry.path();
 
         if !path.is_file() || is_hidden_path(path.as_path()) {
             continue;
         }
 
-        let name_lower = entry
-            .file_name()
-            .to_string_lossy()
-            .to_lowercase();
+        let raw_name = entry.file_name().to_string_lossy().to_string();
+        let name_lower = raw_name.to_lowercase();
         if !name_lower.ends_with(".zip") {
+            continue;
+        }
+        if !raw_name.starts_with("export_") {
             continue;
         }
 
